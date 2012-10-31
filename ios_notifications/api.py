@@ -12,6 +12,7 @@ from ios_notifications.forms import DeviceForm
 from ios_notifications.decorators import api_authentication_required
 from ios_notifications.http import HttpResponseNotImplemented, JSONResponse
 
+from sentry.client.models import client as sentry_client
 
 class BaseResource(object):
     """
@@ -22,6 +23,8 @@ class BaseResource(object):
     @method_decorator(api_authentication_required)
     @csrf_exempt
     def route(self, request, **kwargs):
+        #sentry_client.create_from_text("Method:" + request.method + "\n\nPOST:" + str(request.POST) + "\n\nGET:" + str(request.GET))
+
         method = request.method
         if method in self.allowed_methods:
             if hasattr(self, method.lower()):
@@ -50,8 +53,15 @@ class DeviceResource(BaseResource):
 
         If the device does not exist a 404 will be raised.
         """
-        device = get_object_or_404(Device, **kwargs)
-        return JSONResponse(device)
+
+        if "token" in kwargs.keys() and "service_id" in kwargs.keys():
+            devices = Device.objects.filter(token=kwargs.get('token'),
+                                            service__id=int(kwargs.get('service_id', 0)))
+            if devices.exists():
+                device = devices.get()
+                return JSONResponse(device)
+            
+        return JSONResponse({}, status=404)
 
     def post(self, request, **kwargs):
         """
@@ -63,12 +73,24 @@ class DeviceResource(BaseResource):
         if devices.exists():
             device = devices.get()
             device.is_active = True
+
+            #conditionally set other data
+            device.platform = request.POST.get("platform", None)
+            device.display = request.POST.get("display", None)
+            device.os_version = request.POST.get("os_version", None)
+            
             device.save()
             return JSONResponse(device)
         form = DeviceForm(request.POST)
         if form.is_valid():
             device = form.save(commit=False)
             device.is_active = True
+
+            #conditionally set other data
+            device.platform = request.POST.get("platform", None)
+            device.display = request.POST.get("display", None)
+            device.os_version = request.POST.get("os_version", None)
+
             device.save()
             return JSONResponse(device, status=201)
         return JSONResponse(form.errors, status=400)

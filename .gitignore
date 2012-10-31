@@ -3,3 +3,5 @@
 *.pyc
 *.swp
 build
+
+/django_ios_notifications.egg-info/
