@@ -196,7 +196,7 @@ class Notification(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     last_sent_at = models.DateTimeField(null=True, blank=True)
 
-    article_id = models.IntegerField(null=True)
+    article_id = models.IntegerField(null=True, blank=True)
 
     def push_to_all_devices(self):
         """
