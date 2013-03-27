@@ -12,7 +12,7 @@ from ios_notifications.forms import DeviceForm
 from ios_notifications.decorators import api_authentication_required
 from ios_notifications.http import HttpResponseNotImplemented, JSONResponse
 
-from sentry.client.models import client as sentry_client
+from raven.contrib.django.raven_compat.models import client as sentry_client
 
 class BaseResource(object):
     """
