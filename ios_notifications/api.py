@@ -23,7 +23,7 @@ class BaseResource(object):
     @method_decorator(api_authentication_required)
     @csrf_exempt
     def route(self, request, **kwargs):
-        #sentry_client.capture('Message', message="Method:" + request.method + "\n\nPOST:" + str(request.POST) + "\n\nGET:" + str(request.GET))
+        #captureMessage(level=logging.WARNING, stack=True,  message="Method:" + request.method + "\n\nPOST:" + str(request.POST) + "\n\nGET:" + str(request.GET))
 
         method = request.method
         if method in self.allowed_methods:
