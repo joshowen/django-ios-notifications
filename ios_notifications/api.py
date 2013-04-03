@@ -12,7 +12,6 @@ from ios_notifications.forms import DeviceForm
 from ios_notifications.decorators import api_authentication_required
 from ios_notifications.http import HttpResponseNotImplemented, JSONResponse
 
-from raven.contrib.django.raven_compat.models import client as sentry_client
 
 class BaseResource(object):
     """
@@ -23,7 +22,6 @@ class BaseResource(object):
     @method_decorator(api_authentication_required)
     @csrf_exempt
     def route(self, request, **kwargs):
-        #captureMessage(level=logging.WARNING, stack=True,  message="Method:" + request.method + "\n\nPOST:" + str(request.POST) + "\n\nGET:" + str(request.GET))
 
         method = request.method
         if method in self.allowed_methods:
