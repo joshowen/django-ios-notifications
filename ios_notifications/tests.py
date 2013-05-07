@@ -1,22 +1,29 @@
 # -*- coding: utf-8 -*-
 import subprocess
-import time
 import struct
 import os
-import datetime
+import json
+import uuid
+import StringIO
 
+import django
 from django.test import TestCase
 from django.core.urlresolvers import reverse
 from django.contrib.auth.models import User
-from django.utils import simplejson as json
 from django.http import HttpResponseNotAllowed
 from django.conf import settings
 from django.core import management
 
-from ios_notifications.models import APNService, Device, Notification, NotificationPayloadSizeExceeded
-from ios_notifications.http import JSONResponse
-from ios_notifications.utils import generate_cert_and_pkey
-from ios_notifications.forms import APNServiceForm
+try:
+    from django.utils.timezone import now as dt_now
+except ImportError:
+    import datetime
+    dt_now = datetime.datetime.now
+
+from .models import APNService, Device, Notification, NotificationPayloadSizeExceeded
+from .http import JSONResponse
+from .utils import generate_cert_and_pkey
+from .forms import APNServiceForm
 
 TOKEN = '0fd12510cfe6b0a4a89dc7369c96df956f991e66131dab63398734e8000d0029'
 TEST_PEM = os.path.abspath(os.path.join(os.path.dirname(__file__), 'test.pem'))
@@ -25,10 +32,11 @@ SSL_SERVER_COMMAND = ('openssl', 's_server', '-accept', '2195', '-cert', TEST_PE
 
 
 class APNServiceTest(TestCase):
-    def setUp(self):
-        self.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
-        time.sleep(0.5)  # Wait for test server to be started
+    @classmethod
+    def setUpClass(cls):
+        cls.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
 
+    def setUp(self):
         cert, key = generate_cert_and_pkey()
         self.service = APNService.objects.create(name='test-service', hostname='127.0.0.1',
                                                  certificate=cert, private_key=key)
@@ -36,17 +44,13 @@ class APNServiceTest(TestCase):
         self.device = Device.objects.create(token=TOKEN, service=self.service)
         self.notification = Notification.objects.create(message='Test message', service=self.service)
 
-    def test_connection_to_remote_apn_host(self):
-        self.assertTrue(self.service.connect())
-        self.service.disconnect()
-
     def test_invalid_payload_size(self):
-        n = Notification(message='.' * 260)
-        self.assertRaises(NotificationPayloadSizeExceeded, self.service.get_payload, n)
+        n = Notification(message='.' * 250)
+        self.assertRaises(NotificationPayloadSizeExceeded, self.service.pack_message, n.payload, self.device)
 
     def test_payload_packed_correctly(self):
         fmt = self.service.fmt
-        payload = self.service.get_payload(self.notification)
+        payload = self.notification.payload
         msg = self.service.pack_message(payload, self.device)
         unpacked = struct.unpack(fmt % len(payload), msg)
         self.assertEqual(unpacked[-1], payload)
@@ -59,6 +63,7 @@ class APNServiceTest(TestCase):
         self.assertIsNone(self.device.last_notified_at)
         self.service.push_notification_to_devices(self.notification, [self.device])
         self.assertIsNotNone(self.notification.last_sent_at)
+        self.device = Device.objects.get(pk=self.device.pk)  # Refresh the object with values from db
         self.assertIsNotNone(self.device.last_notified_at)
 
     def test_create_with_passphrase(self):
@@ -72,12 +77,25 @@ class APNServiceTest(TestCase):
         self.assertFalse(form.is_valid())
         self.assertTrue('passphrase' in form.errors)
 
-    def tearDown(self):
-        self.test_server_proc.kill()
+    def test_pushing_notification_in_chunks(self):
+        devices = []
+        for i in xrange(10):
+            token = uuid.uuid1().get_hex() * 2
+            device = Device.objects.create(token=token, service=self.service)
+            devices.append(device)
+
+        started_at = dt_now()
+        self.service.push_notification_to_devices(self.notification, devices, chunk_size=2)
+        device_count = len(devices)
+        self.assertEquals(device_count,
+                          Device.objects.filter(last_notified_at__gte=started_at).count())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.test_server_proc.kill()
 
 
 class APITest(TestCase):
-
     def setUp(self):
         self.service = APNService.objects.create(name='sandbox', hostname='gateway.sandbox.push.apple.com')
         self.device_token = TOKEN
@@ -221,51 +239,141 @@ class AuthenticationDecoratorTestAuthBasic(TestCase):
 
 
 class NotificationTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
+
     def setUp(self):
-        self.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
-        time.sleep(0.5)
         cert, key = generate_cert_and_pkey()
         self.service = APNService.objects.create(name='service', hostname='127.0.0.1',
                                                  private_key=key, certificate=cert)
         self.service.PORT = 2195  # For ease of use simply change port to default port in test_server
-
-        self.notification = Notification.objects.create(service=self.service, message='Test message')
-
-    def test_invalid_length(self):
-        long_message = '.' * 260
-        self.assertFalse(Notification.is_valid_length(long_message))
+        self.custom_payload = json.dumps({"." * 10: "." * 50})
+        self.notification = Notification.objects.create(service=self.service, message='Test message', custom_payload=self.custom_payload)
 
     def test_valid_length(self):
-        self.assertTrue(Notification.is_valid_length(self.notification.message))
+        self.notification.message = 'test message'
+        self.assertTrue(self.notification.is_valid_length())
 
-    def test_push_to_all_devices(self):
+    def test_invalid_length(self):
+        self.notification.message = '.' * 250
+        self.assertFalse(self.notification.is_valid_length())
+
+    def test_invalid_length_with_custom_payload(self):
+        self.notification.message = '.' * 100
+        self.notification.custom_payload = '{"%s":"%s"}' % ("." * 20, "." * 120)
+        self.assertFalse(self.notification.is_valid_length())
+
+    def test_extra_property_with_custom_payload(self):
+        custom_payload = {"." * 10: "." * 50, "nested": {"+" * 10: "+" * 50}}
+        self.notification.extra = custom_payload
+        self.assertEqual(self.notification.custom_payload, json.dumps(custom_payload))
+        self.assertEqual(self.notification.extra, custom_payload)
+        self.assertTrue(self.notification.is_valid_length())
+
+    def test_extra_property_not_dict(self):
+        with self.assertRaises(TypeError):
+            self.notification.extra = 111
+
+    def test_extra_property_none(self):
+        self.notification.extra = None
+        self.assertEqual(self.notification.extra, None)
+        self.assertEqual(self.notification.custom_payload, '')
+        self.assertTrue(self.notification.is_valid_length())
+
+    def test_push_to_all_devices_persist_existing(self):
         self.assertIsNone(self.notification.last_sent_at)
+        self.notification.persist = False
         self.notification.push_to_all_devices()
         self.assertIsNotNone(self.notification.last_sent_at)
 
-    def tearDown(self):
-        self.test_server_proc.kill()
+    def test_push_to_all_devices_persist_new(self):
+        notification = Notification(service=self.service, message='Test message (new)')
+        notification.persist = True
+        notification.push_to_all_devices()
+        self.assertIsNotNone(notification.last_sent_at)
+        self.assertIsNotNone(notification.pk)
+
+    def test_push_to_all_devices_no_persist(self):
+        notification = Notification(service=self.service, message='Test message (new)')
+        notification.persist = False
+        notification.push_to_all_devices()
+        self.assertIsNone(notification.last_sent_at)
+        self.assertIsNone(notification.pk)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.test_server_proc.kill()
 
 
 class ManagementCommandPushNotificationTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
+
     def setUp(self):
-        self.started_at = datetime.datetime.now()
-        self.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
-        time.sleep(0.5)
+        self.started_at = dt_now()
         cert, key = generate_cert_and_pkey()
         self.service = APNService.objects.create(name='service', hostname='127.0.0.1',
                                                  private_key=key, certificate=cert)
         self.service.PORT = 2195
         self.device = Device.objects.create(token=TOKEN, service=self.service)
 
-    def test_call_push_ios_notification_command(self):
+        self.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = getattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS', 'NotSpecified')
+
+    def test_call_push_ios_notification_command_persist(self):
         msg = 'some message'
+        management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0, 'persist': True})
+        self.assertTrue(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
+        self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
+
+    def test_call_push_ios_notification_command_no_persist(self):
+        msg = 'some message'
+        management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0, 'persist': False})
+        self.assertFalse(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
+        self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
+
+    def test_call_push_ios_notification_command_default_persist(self):
+        msg = 'some message'
+        settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = True
         management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0})
         self.assertTrue(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
         self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
 
+    def test_call_push_ios_notification_command_default_no_persist(self):
+        msg = 'some message'
+        settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = False
+        management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0})
+        self.assertFalse(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
+        self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
+
+    def test_call_push_ios_notification_command_default_persist_not_specified(self):
+        msg = 'some message'
+        if hasattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS'):
+            del settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS
+        management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0})
+        self.assertTrue(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
+        self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
+
+    def test_either_message_or_extra_option_required(self):
+        # In Django < 1.5 django.core.management.base.BaseCommand.execute
+        # catches CommandError and raises SystemExit instead.
+        exception = SystemExit if django.VERSION < (1, 5) else management.base.CommandError
+
+        with self.assertRaises(exception):
+            management.call_command('push_ios_notification', service=self.service.pk,
+                                    verbosity=0, stderr=StringIO.StringIO())
+
     def tearDown(self):
-        self.test_server_proc.kill()
+        if self.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS == 'NotSpecified':
+            if hasattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS'):
+                del settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS
+        else:
+            settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = self.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.test_server_proc.kill()
 
 
 class ManagementCommandCallFeedbackService(TestCase):

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import re
 
 from django.http import HttpResponseNotAllowed, QueryDict
 from django.views.decorators.csrf import csrf_exempt
@@ -7,10 +8,10 @@ from django.db import IntegrityError
 from django.contrib.auth.models import User
 from django.utils.decorators import method_decorator
 
-from ios_notifications.models import Device
-from ios_notifications.forms import DeviceForm
-from ios_notifications.decorators import api_authentication_required
-from ios_notifications.http import HttpResponseNotImplemented, JSONResponse
+from .models import Device
+from .forms import DeviceForm
+from .decorators import api_authentication_required
+from .http import HttpResponseNotImplemented, JSONResponse
 
 
 class BaseResource(object):
@@ -66,7 +67,11 @@ class DeviceResource(BaseResource):
         Creates a new device or updates an existing one to `is_active=True`.
         Expects two non-options POST parameters: `token` and `service`.
         """
-        devices = Device.objects.filter(token=request.POST.get('token'),
+        token = request.POST.get('token')
+        if token is not None:
+            # Strip out any special characters that may be in the token
+            token = re.sub('<|>|\s', '', token)
+        devices = Device.objects.filter(token=token,
                                         service__id=int(request.POST.get('service', 0)))
         if devices.exists():
             device = devices.get()

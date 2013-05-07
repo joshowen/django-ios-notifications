@@ -1,31 +1,23 @@
 # -*- coding: utf-8 -*-
 import socket
 import struct
+import errno
+import json
 from binascii import hexlify, unhexlify
-import datetime
 
 from django.db import models
-from django.contrib.auth.models import User
-from django.utils import simplejson as json
-from django_fields.fields import EncryptedCharField
 from django.conf import settings
 
+try:
+    from django.utils.timezone import now as dt_now
+except ImportError:
+    import datetime
+    dt_now = datetime.datetime.now
+
+from django_fields.fields import EncryptedCharField
 import OpenSSL
 
-
-class NotificationPayloadSizeExceeded(Exception):
-    def __init__(self, message='The notification maximum payload size of 256 bytes was exceeded'):
-        super(NotificationPayloadSizeExceeded, self).__init__(message)
-
-
-class NotConnectedException(Exception):
-    def __init__(self, message='You must open a socket connection before writing a message'):
-        super(NotConnectedException, self).__init__(message)
-
-
-class InvalidPassPhrase(Exception):
-    def __init__(self, message='The passphrase for the private key appears to be invalid'):
-        super(InvalidPassPhrase, self).__init__(message)
+from .exceptions import NotificationPayloadSizeExceeded, InvalidPassPhrase
 
 
 class BaseService(models.Model):
@@ -37,7 +29,7 @@ class BaseService(models.Model):
     PORT = 0  # Should be overriden by subclass
     connection = None
 
-    def connect(self, certificate, private_key, passphrase=None):
+    def _connect(self, certificate, private_key, passphrase=None):
         """
         Establishes an encrypted SSL socket connection to the service.
         After connecting the socket can be written to or read from.
@@ -60,15 +52,9 @@ class BaseService(models.Model):
         self.connection = OpenSSL.SSL.Connection(context, sock)
         self.connection.connect((self.hostname, self.PORT))
         self.connection.set_connect_state()
-        try:
-            self.connection.do_handshake()
-            return True
-        except Exception as e:
-            if getattr(settings, 'DEBUG', False):
-                print e, e.__class__
-        return False
+        self.connection.do_handshake()
 
-    def disconnect(self):
+    def _disconnect(self):
         """
         Closes the SSL socket connection.
         """
@@ -95,14 +81,14 @@ class APNService(BaseService):
     PORT = 2195
     fmt = '!cH32sH%ds'
 
-    def connect(self):
+    def _connect(self):
         """
         Establishes an encrypted SSL socket connection to the service.
         After connecting the socket can be written to or read from.
         """
-        return super(APNService, self).connect(self.certificate, self.private_key, self.passphrase)
+        return super(APNService, self)._connect(self.certificate, self.private_key, self.passphrase)
 
-    def push_notification_to_devices(self, notification, devices=None):
+    def push_notification_to_devices(self, notification, devices=None, chunk_size=100):
         """
         Sends the specific notification to devices.
         if `devices` is not supplied, all devices in the `APNService`'s device
@@ -110,11 +96,9 @@ class APNService(BaseService):
         """
         if devices is None:
             devices = self.device_set.filter(is_active=True)
-        if self.connect():
-            self._write_message(notification, devices)
-            self.disconnect()
+        self._write_message(notification, devices, chunk_size)
 
-    def _write_message(self, notification, devices):
+    def _write_message(self, notification, devices, chunk_size):
         """
         Writes the message for the supplied devices to
         the APN Service SSL socket.
@@ -122,49 +106,54 @@ class APNService(BaseService):
         if not isinstance(notification, Notification):
             raise TypeError('notification should be an instance of ios_notifications.models.Notification')
 
-        if self.connection is None:
-            if not self.connect():
-                return
+        if not isinstance(chunk_size, int) or chunk_size < 1:
+            raise ValueError('chunk_size must be an integer greater than zero.')
 
-        payload = self.get_payload(notification)
+        payload = notification.payload
 
-        for device in devices:
-            try:
-                self.connection.send(self.pack_message(payload, device))
-            except OpenSSL.SSL.WantWriteError:
-                self.disconnect()
-                i = devices.index(device)
-                if isinstance(devices, models.query.QuerySet):
-                    devices.update(last_notified_at=datetime.datetime.now())
-                devices[:i].update(last_notified_at=datetime.datetime.now())
-                return self._write_message(notification, devices[i:]) if self.connect() else None
-        if isinstance(devices, models.query.QuerySet):
-            devices.update(last_notified_at=datetime.datetime.now())
-        else:
-            for device in devices:
-                device.last_notified_at = datetime.datetime.now()
-                device.save()
-        notification.last_sent_at = datetime.datetime.now()
-        notification.save()
+        # Split the devices into manageable chunks.
+        # Chunk sizes being determined by the `chunk_size` arg.
+        device_length = devices.count() if isinstance(devices, models.query.QuerySet) else len(devices)
+        chunks = [devices[i:i + chunk_size] for i in xrange(0, device_length, chunk_size)]
 
-    def get_payload(self, notification):
-        aps = {'alert': notification.message}
-        if notification.badge is not None:
-            aps['badge'] = notification.badge
-        if notification.sound is not None:
-            aps['sound'] = notification.sound
+        for index in xrange(len(chunks)):
+            chunk = chunks[index]
+            self._connect()
 
-        message = {'aps': aps}
+            for device in chunk:
+                if not device.is_active:
+                    continue
+                try:
+                    self.connection.send(self.pack_message(payload, device))
+                except (OpenSSL.SSL.WantWriteError, socket.error) as e:
+                    if isinstance(e, socket.error) and isinstance(e.args, tuple) and e.args[0] != errno.EPIPE:
+                        raise e  # Unexpected exception, raise it.
+                    self._disconnect()
+                    i = chunk.index(device)
+                    self.set_devices_last_notified_at(chunk[:i])
+                    # Start again from the next device.
+                    # We start from the next device since
+                    # if the device no longer accepts push notifications from your app
+                    # and you send one to it anyways, Apple immediately drops the connection to your APNS socket.
+                    # http://stackoverflow.com/a/13332486/1025116
+                    self._write_message(notification, chunk[i + 1:])
 
-        if notification.article_id is not None:
-            message['article_id'] = notification.article_id
+            self._disconnect()
 
-        payload = json.dumps(message, separators=(',', ':'))
+            self.set_devices_last_notified_at(chunk)
 
-        if len(payload) > 256:
-            raise NotificationPayloadSizeExceeded
+        if notification.pk or notification.persist:
+            notification.last_sent_at = dt_now()
+            notification.save()
 
-        return payload
+    def set_devices_last_notified_at(self, devices):
+        # Rather than do a save on every object,
+        # fetch another queryset and use it to update
+        # the devices in a single query.
+        # Since the devices argument could be a sliced queryset
+        # we can't rely on devices.update() even if devices is
+        # a queryset object.
+        Device.objects.filter(pk__in=[d.pk for d in devices]).update(last_notified_at=dt_now())
 
     def pack_message(self, payload, device):
         """
@@ -179,7 +168,7 @@ class APNService(BaseService):
         return msg
 
     def __unicode__(self):
-        return u'APNService %s' % self.name
+        return self.name
 
     class Meta:
         unique_together = ('name', 'hostname')
@@ -190,13 +179,37 @@ class Notification(models.Model):
     Represents a notification which can be pushed to an iOS device.
     """
     service = models.ForeignKey(APNService)
-    message = models.CharField(max_length=200)
-    badge = models.PositiveIntegerField(default=1, null=True)
-    sound = models.CharField(max_length=30, null=True, default='default')
+    message = models.CharField(max_length=200, blank=True, help_text='Alert message to display to the user. Leave empty if no alert should be displayed to the user.')
+    badge = models.PositiveIntegerField(null=True, blank=True, help_text='New application icon badge number. Set to None if the badge number must not be changed.')
+    sound = models.CharField(max_length=30, blank=True, help_text='Name of the sound to play. Leave empty if no sound should be played.')
     created_at = models.DateTimeField(auto_now_add=True)
     last_sent_at = models.DateTimeField(null=True, blank=True)
+    custom_payload = models.CharField(max_length=240, blank=True, help_text='JSON representation of an object containing custom payload.')
 
-    article_id = models.IntegerField(null=True, blank=True)
+    def __init__(self, *args, **kwargs):
+        self.persist = getattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS', True)
+        super(Notification, self).__init__(*args, **kwargs)
+
+    def __unicode__(self):
+        return u'%s%s%s' % (self.message, ' ' if self.message and self.custom_payload else '', self.custom_payload)
+
+    @property
+    def extra(self):
+        """
+        The extra property is used to specify custom payload values
+        outside the Apple-reserved aps namespace
+        http://developer.apple.com/library/mac/#documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/ApplePushService/ApplePushService.html#//apple_ref/doc/uid/TP40008194-CH100-SW1
+        """
+        return json.loads(self.custom_payload) if self.custom_payload else None
+
+    @extra.setter
+    def extra(self, value):
+        if value is None:
+            self.custom_payload = ''
+        else:
+            if not isinstance(value, dict):
+                raise TypeError('must be a valid Python dictionary')
+            self.custom_payload = json.dumps(value)  # Raises a TypeError if can't be serialized
 
     def push_to_all_devices(self):
         """
@@ -205,26 +218,29 @@ class Notification(models.Model):
         """
         self.service.push_notification_to_devices(self)
 
-    def __unicode__(self):
-        return u'Notification: %s' % self.message
-
-    @staticmethod
-    def is_valid_length(message, badge=None, sound=None, article_id=None):
+    def is_valid_length(self):
         """
         Determines if a notification payload is a valid length.
 
         returns bool
         """
-        aps = {'alert': message}
-        if badge is not None:
-            aps['badge'] = badge
-        if sound is not None:
-            aps['sound'] = sound
+        return len(self.payload) <= 256
+
+    @property
+    def payload(self):
+        aps = {}
+        if self.message:
+            aps['alert'] = self.message
+        if self.badge is not None:
+            aps['badge'] = self.badge
+        if self.sound:
+            aps['sound'] = self.sound
         message = {'aps': aps}
-        if article_id is not None:
-            message['article_id'] = article_id
+        extra = self.extra
+        if extra is not None:
+            message.update(extra)
         payload = json.dumps(message, separators=(',', ':'))
-        return len(payload) <= 256
+        return payload
 
 
 class Device(models.Model):
@@ -235,7 +251,7 @@ class Device(models.Model):
     is_active = models.BooleanField(default=True)
     deactivated_at = models.DateTimeField(null=True, blank=True)
     service = models.ForeignKey(APNService)
-    users = models.ManyToManyField(User, null=True, blank=True, related_name='ios_devices')
+    users = models.ManyToManyField(getattr(settings, 'AUTH_USER_MODEL', 'auth.User'), null=True, blank=True, related_name='ios_devices')
     added_at = models.DateTimeField(auto_now_add=True)
     last_notified_at = models.DateTimeField(null=True, blank=True)
     platform = models.CharField(max_length=30, blank=True, null=True)
@@ -251,10 +267,9 @@ class Device(models.Model):
             raise TypeError('notification should be an instance of ios_notifications.models.Notification')
 
         notification.service.push_notification_to_devices(notification, [self])
-        self.save()
 
     def __unicode__(self):
-        return u'Device %s' % self.token
+        return self.token
 
     class Meta:
         unique_together = ('token', 'service')
@@ -274,34 +289,35 @@ class FeedbackService(BaseService):
 
     fmt = '!lh32s'
 
-    def connect(self):
+    def _connect(self):
         """
         Establishes an encrypted socket connection to the feedback service.
         """
-        return super(FeedbackService, self).connect(self.apn_service.certificate, self.apn_service.private_key, self.apn_service.passphrase)
+        return super(FeedbackService, self).connect(self.apn_service.certificate, self.apn_service.private_key, self.apns_service.passphrase)
 
     def call(self):
         """
         Calls the feedback service and deactivates any devices the feedback service mentions.
         """
-        if self.connect():
-            device_tokens = []
-            try:
-                while True:
-                    data = self.connection.recv(38)  # 38 being the length in bytes of the binary format feedback tuple.
-                    timestamp, token_length, token = struct.unpack(self.fmt, data)
-                    device_token = hexlify(token)
-                    device_tokens.append(device_token)
-            except OpenSSL.SSL.ZeroReturnError:
-                # Nothing to receive
-                pass
-            devices = Device.objects.filter(token__in=device_tokens, service=self.apn_service)
-            devices.update(is_active=False, deactivated_at=datetime.datetime.now())
-            self.disconnect()
-            return devices.count()
+        self._connect()
+        device_tokens = []
+        try:
+            while True:
+                data = self.connection.recv(38)  # 38 being the length in bytes of the binary format feedback tuple.
+                timestamp, token_length, token = struct.unpack(self.fmt, data)
+                device_token = hexlify(token)
+                device_tokens.append(device_token)
+        except OpenSSL.SSL.ZeroReturnError:
+            # Nothing to receive
+            pass
+        finally:
+            self._disconnect()
+        devices = Device.objects.filter(token__in=device_tokens, service=self.apn_service)
+        devices.update(is_active=False, deactivated_at=dt_now())
+        return devices.count()
 
     def __unicode__(self):
-        return u'FeedbackService %s' % self.name
+        return self.name
 
     class Meta:
         unique_together = ('name', 'hostname')

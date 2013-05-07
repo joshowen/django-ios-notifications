@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 
+try:
+    from django.conf.urls import patterns, url
+except ImportError:  # deprecated since Django 1.4
+    from django.conf.urls.defaults import patterns, url
+
 from django.contrib import admin
-from ios_notifications.models import Device, Notification, APNService, FeedbackService
-from ios_notifications.forms import APNServiceForm
-from django.conf.urls.defaults import patterns, url
 from django.template.response import TemplateResponse
 from django.shortcuts import get_object_or_404
+
+from .models import Device, Notification, APNService, FeedbackService
+from .forms import APNServiceForm
 
 
 class APNServiceAdmin(admin.ModelAdmin):
@@ -15,18 +20,23 @@ class APNServiceAdmin(admin.ModelAdmin):
 
 class DeviceAdmin(admin.ModelAdmin):
     fields = ('token', 'is_active', 'service')
-    list_display = ('token', 'is_active', 'service', 'last_notified_at', 'platform', 'display', 'os_version')
+    list_display = ('token', 'is_active', 'service', 'last_notified_at', 'platform', 'display', 'os_version', 'added_at', 'deactivated_at')
+    list_filter = ('is_active', 'last_notified_at', 'added_at', 'deactivated_at')
+    search_fields = ('token', 'platform')
 
 
 class NotificationAdmin(admin.ModelAdmin):
     exclude = ('last_sent_at',)
-    list_display = ('message', 'badge', 'sound', 'created_at', 'last_sent_at')
+    list_display = ('message', 'badge', 'sound', 'custom_payload', 'created_at', 'last_sent_at',)
+    list_filter = ('created_at', 'last_sent_at')
+    search_fields = ('message', 'custom_payload')
+    list_display_links = ('message', 'custom_payload',)
 
     def get_urls(self):
         urls = super(NotificationAdmin, self).get_urls()
         notification_urls = patterns('',
-            url(r'^(?P<id>\d+)/push-notification/$', self.admin_site.admin_view(self.admin_push_notification),
-            name='admin_push_notification'),)
+                                     url(r'^(?P<id>\d+)/push-notification/$', self.admin_site.admin_view(self.admin_push_notification),
+                                     name='admin_push_notification'),)
         return notification_urls + urls
 
     def admin_push_notification(self, request, **kwargs):

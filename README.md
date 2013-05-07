@@ -24,13 +24,14 @@ If you want to use the API for registering devices you will also need to make th
 
 ```python
 urlpatterns = patterns('',
-    ...
+    # ...
     url(r'^ios-notifications/', include('ios_notifications.urls')),
-    ...
+    # ...
 )
 ```
 
 After that you will need to run `./manage.py syncdb` to create the database tables required for django-ios-notifications.
+Alternatively there are also south migrations available for those who prefer to use south.
 
 
 Setting up the APN Services
@@ -145,22 +146,82 @@ Another options is to use the built in management command provided by django-ios
 You can do this by calling `./manage.py push_ios_notification` from the command line.
 You will need to provide some arguments to the command in order to create and send a notification.
 
-There are two required options and two optional ones.
 
-The required arguments are:
+There is only one required argument:
 
-* `--message` is a string containing the main message of your notification. e.g. `--message='This is a push notification from Django iOS Notifications!'`
 * `--service` is the id of the APN Service you wish to use. e.g. `--service=123`.
 
 The optional arguments you may pass are:
 
+* `--message` is a string containing the main message of your notification. e.g. `--message='This is a push notification from Django iOS Notifications!'`
 * `--badge` is an integer value to represent the badge value that will appear over your app's springboard icon after receiving the notification. e.g. `--badge=2`.
 * `--sound` is the sound to be played when the device receives your application. This can either be one of the built in sounds or one that you have included in your app. e.g. `--sound=default`.
+* `--extra` is for specifying any extra custom payload values you want to send with your notification. This should be in the form of a valid JSON dictionary. e.g. `--extra='{"foo": "bar", "baz": [1, 2, 3], "qux": 1}'`.
+* `--persist` is for forcing persistence of notifications in the database.
+* `--no-persist` will not save the notification to the database.
 
-Note that if you do not provide the optional arguments the default values for both are `None`. This means the device will
-neither play a sound or update the badge of your app's icon when receiving the notification.
+Note that in order to play a sound the `--sound` parameter must be supplied. Likewise, to display a badge number on the app icon
+the `--badge` parameter should be supplied.
 
-A full example: `./manage.py push_ios_notification --message='This is a push notification from Django iOS Notifications!' --service=123 --badge=1 --sound=default`.
+A full example:
+```bash
+./manage.py push_ios_notification \
+    --message='This is a push notification from Django iOS Notifications!' \
+    --service=123 \
+    --badge=1 \
+    --sound=default \
+    --extra='{"foo": "bar", "baz": [1, 2, 3], "qux": 1}' \
+    --persist
+```
+
+
+Sending a notification to a subset of devices.
+-----------------
+
+If you wish to send a notification to just a subset of devices you can use the django-ios-notifications API to easily do so.
+The main assumption here is that you will have some way of knowing to which devices you wish to push a notification.
+
+Below follows a simple example of how to push a notification to a subset of devices based of their unique push tokens.
+
+Note that the notification is sent to devices in chunks. The chunk size can be specified in `APNService.push_notification_to_devices`.
+The default chunk size is 100. There is some debate on the ideal chunk size, but using chunks larger than a few hundred at a time is
+not recommended.
+
+```python
+device_tokens = ('97bc2e598e1a11e2bacfb8f6b113c99597bd77428e1a11e2ae36b8f6b113c995',
+                 '9c97e3d78e1a11e28470b8f6b113c9959c97e5a38e1a11e28fd6b8f6b113c995',
+                 'ba32393d8e1a11e28035b8f6b113c995ba323b0a8e1a11e28254b8f6b113c995',
+                 'c71667578e1a11e2a5cfb8f6b113c995c716692e8e1a11e29c74b8f6b113c995')
+
+apns = APNService.objects.get(hostname='gateway.push.apple.com', name='production')
+devices = Device.objects.filter(token__in=device_tokens, service=apns)
+notification = Notification.objects.create(message='Some message', service=apns)
+apns.push_notification_to_devices(notification, devices, chunk_size=200)  # Override the default chunk size to 200 (instead of 100)
+```
+
+Note, you simply need to use the `APNService.push_notification_to_devices` method to push a notification to the devices.
+
+
+Connecting to the APNService.
+-----------------
+
+When you push a notification, a connection to the APNService is opened. It should be noted that this can raise
+an exception if a problem occurred when attempting to make the connection.
+
+See the [pyOpenSSL documentation](http://pythonhosted.org/pyOpenSSL/openssl-ssl.html#openssl-ssl) for more information.
+
+
+Notification persistence
+-----------------
+
+By default notification objects are saved to the database. If you do not require this behaviour it is possible
+to disable notification persistence.
+
+In your `settings.py` file include the following:
+
+```python
+IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = False
+```
 
 
 API Authentication
@@ -193,11 +254,6 @@ See [Basic access authentication](http://en.wikipedia.org/wiki/Basic_access_auth
 ### `AuthBasicIsStaff`
 
 This is the same as `AuthBasic` except that the request will only be allowed if the user is a staff user.
-
-
-### `AuthOAuth`
-
-OAuth authentication will be supported in future versions.
 
 
 The Feedback Service and deactivating devices
@@ -251,6 +307,13 @@ http://127.0.0.1:8000/admin/ios_notifications/device/
 
 See [Issues with Using the Feedback Service](http://developer.apple.com/library/ios/#technotes/tn2265/_index.html
 for more details)
+
+
+Contributors
+-----------------
+Stephen Muss
+
+Maxime Bargiel
 
 ***
 

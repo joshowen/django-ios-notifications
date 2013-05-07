@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 
-from django.conf.urls.defaults import url, patterns
-from ios_notifications.api import routes
+try:
+    from django.conf.urls import patterns, url
+except ImportError:  # deprecated since Django 1.4
+    from django.conf.urls.defaults import patterns, url
+
+from .api import routes
 
 urlpatterns = patterns('',
     url(r'^device/$', routes.device, name='ios-notifications-device-create'),
