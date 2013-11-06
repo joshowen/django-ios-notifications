@@ -26,7 +26,8 @@ setup(
     install_requires=[
         'Django>=1.3',
         'pyOpenSSL>=0.10',
-        'django-fields>=0.1.2'
+        'django-fields>=0.1.2',
+        'apns-client==0.1.8'
     ],
     zip_safe=False
 )
