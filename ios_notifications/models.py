@@ -3,6 +3,7 @@ import socket
 import struct
 import errno
 import json
+import sys
 from binascii import hexlify, unhexlify
 
 from django.db import models
@@ -127,7 +128,8 @@ class APNService(BaseService):
     def _write_message_with_apnsclient(self, message, devices):
 
         # start with all devices in "complete" list. remove as necessary.
-        complete_devices = devices[:]
+        # convert to list: attempting to avoid deadlock in "set_devices_last_notified_at"
+        complete_devices = list(devices[:])
         fail_devices = []
         retry_devices = []
 
@@ -238,7 +240,17 @@ class APNService(BaseService):
         # Since the devices argument could be a sliced queryset
         # we can't rely on devices.update() even if devices is
         # a queryset object.
-        Device.objects.filter(pk__in=[d.pk for d in devices]).update(last_notified_at=dt_now())
+
+        try:
+            Device.objects.filter(pk__in=[d.pk for d in devices]).update(last_notified_at=dt_now())
+        except:
+            # catchall for deadlock; should not occur, but notifications are too important to be allowed to fail\
+            client = Client(dsn=settings.RAVEN_CONFIG['dsn'])
+            try:
+                exc_info = sys.exc_info()
+                client.captureException(exc_info)
+            finally:
+                del exc_info
 
     def pack_message(self, payload, device):
         """
