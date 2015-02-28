@@ -7,31 +7,34 @@ Django iOS Notifications makes it easy to send push notifications to iOS devices
 Installation
 -----------------
 
-You can install with pip: `pip install django-ios-notifications`.
 
-You then need to add `ios_notifications` to `INSTALLED_APPS` in your settings file.
+Minimum Requirements
 
-The minimum Python version supported is Python 2.6 while the minimum Django version required is 1.3.
-There are also two other hard dependencies:
+* Python 2.6 or greater
+* Django 1.3 or greater
+
+Two hard dependencies:
 
 * `pyOpenSSL >= 0.10`
-* `django-fields >= 0.1.2`
+* `django-fields >= 0.2.2`
+
+* * *
+
+1. You can install with pip: 
+	* `pip install django-ios-notifications` to get the latest release version
+	* `pip install git+https://github.com/stephenmuss/django-ios-notifications.git#egg=django-ios-notifications` to install the latest bleeding-edge/development version
+2. Add `ios_notifications` to `INSTALLED_APPS` in settings file.
+3. If you want to use the API for registering devices you will need to make the appropriate changes to your urls file.
+	* `url(r'^ios-notifications/', include('ios_notifications.urls'))`
+4. Create required database tables. 
+	* `./manage.py syncdb` 
+	* If using south `./manage.py migrate ios_notifications`
 
 
-After installation, you then need to add `ios_notifications` to `INSTALLED_APPS` in your settings file.
-
-If you want to use the API for registering devices you will also need to make the appropriate changes to your urls file:
-
-```python
-urlpatterns = patterns('',
-    # ...
-    url(r'^ios-notifications/', include('ios_notifications.urls')),
-    # ...
-)
-```
-
-After that you will need to run `./manage.py syncdb` to create the database tables required for django-ios-notifications.
-Alternatively there are also south migrations available for those who prefer to use south.
+Notes on Upgrading to 0.2.0
+-----------------
+If you are upgrading to 0.2.0 from an older verion and you use password protection in any of your `APNService`s you will need to renter the password and resave the model for each one.
+This is due to changes in more recent versions of `django-fields`.
 
 
 Setting up the APN Services

@@ -5,3 +5,4 @@
 build
 
 /django_ios_notifications.egg-info/
+.DS_Store

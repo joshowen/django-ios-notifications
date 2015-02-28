@@ -8,10 +8,16 @@ import StringIO
 
 import django
 from django.test import TestCase
+
+try:
+    from django.test.utils import override_settings
+except ImportError:
+    from override_settings import override_settings
+
+from django.conf import settings
 from django.core.urlresolvers import reverse
 from django.contrib.auth.models import User
 from django.http import HttpResponseNotAllowed
-from django.conf import settings
 from django.core import management
 
 try:
@@ -24,6 +30,7 @@ from .models import APNService, Device, Notification, NotificationPayloadSizeExc
 from .http import JSONResponse
 from .utils import generate_cert_and_pkey
 from .forms import APNServiceForm
+from .settings import get_setting
 
 TOKEN = '0fd12510cfe6b0a4a89dc7369c96df956f991e66131dab63398734e8000d0029'
 TEST_PEM = os.path.abspath(os.path.join(os.path.dirname(__file__), 'test.pem'))
@@ -31,11 +38,19 @@ TEST_PEM = os.path.abspath(os.path.join(os.path.dirname(__file__), 'test.pem'))
 SSL_SERVER_COMMAND = ('openssl', 's_server', '-accept', '2195', '-cert', TEST_PEM)
 
 
-class APNServiceTest(TestCase):
+class UseMockSSLServerMixin(object):
     @classmethod
     def setUpClass(cls):
+        super(UseMockSSLServerMixin, cls).setUpClass()
         cls.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
 
+    @classmethod
+    def tearDownClass(cls):
+        cls.test_server_proc.kill()
+        super(UseMockSSLServerMixin, cls).tearDownClass()
+
+
+class APNServiceTest(UseMockSSLServerMixin, TestCase):
     def setUp(self):
         cert, key = generate_cert_and_pkey()
         self.service = APNService.objects.create(name='test-service', hostname='127.0.0.1',
@@ -90,18 +105,17 @@ class APNServiceTest(TestCase):
         self.assertEquals(device_count,
                           Device.objects.filter(last_notified_at__gte=started_at).count())
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.test_server_proc.kill()
 
+@override_settings(IOS_NOTIFICATIONS_AUTHENTICATION='AuthNone')
+class APITest(UseMockSSLServerMixin, TestCase):
+    urls = 'ios_notifications.urls'
 
-class APITest(TestCase):
     def setUp(self):
-        self.service = APNService.objects.create(name='sandbox', hostname='gateway.sandbox.push.apple.com')
+        cert, key = generate_cert_and_pkey()
+        self.service = APNService.objects.create(name='test-service', hostname='127.0.0.1',
+                                                 certificate=cert, private_key=key)
         self.device_token = TOKEN
         self.user = User.objects.create(username='testuser', email='test@example.com')
-        self.AUTH = getattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'NotSpecified')
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthNone')
         self.device = Device.objects.create(service=self.service, token='0fd12510cfe6b0a4a89dc7369d96df956f991e66131dab63398734e8000d0029')
 
     def test_register_device_invalid_params(self):
@@ -157,29 +171,24 @@ class APITest(TestCase):
         device_json = json.loads(content)
         self.assertEqual(device_json.get('model'), 'ios_notifications.device')
 
-    def tearDown(self):
-        if self.AUTH == 'NotSpecified':
-            del settings.IOS_NOTIFICATIONS_AUTHENTICATION
-        else:
-            setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', self.AUTH)
 
+class AuthenticationDecoratorTestAuthBasic(UseMockSSLServerMixin, TestCase):
+    urls = 'ios_notifications.urls'
 
-class AuthenticationDecoratorTestAuthBasic(TestCase):
     def setUp(self):
-        self.service = APNService.objects.create(name='sandbox', hostname='gateway.sandbox.push.apple.com')
+        cert, key = generate_cert_and_pkey()
+        self.service = APNService.objects.create(name='test-service', hostname='127.0.0.1',
+                                                 certificate=cert, private_key=key)
         self.device_token = TOKEN
         self.user_password = 'abc123'
         self.user = User.objects.create(username='testuser', email='test@example.com')
         self.user.set_password(self.user_password)
         self.user.is_staff = True
         self.user.save()
-
-        self.AUTH = getattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'NotSpecified')
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthBasic')
         self.device = Device.objects.create(service=self.service, token='0fd12510cfe6b0a4a89dc7369d96df956f991e66131dab63398734e8000d0029')
 
+    @override_settings(IOS_NOTIFICATIONS_AUTHENTICATION='AuthBasic')
     def test_basic_authorization_request(self):
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthBasic')
         kwargs = {'token': self.device.token, 'service__id': self.device.service.id}
         url = reverse('ios-notifications-device', kwargs=kwargs)
         user_pass = '%s:%s' % (self.user.username, self.user_password)
@@ -187,8 +196,8 @@ class AuthenticationDecoratorTestAuthBasic(TestCase):
         resp = self.client.get(url, {}, HTTP_AUTHORIZATION=auth_header)
         self.assertEquals(resp.status_code, 200)
 
+    @override_settings(IOS_NOTIFICATIONS_AUTHENTICATION='AuthBasic')
     def test_basic_authorization_request_invalid_credentials(self):
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthBasic')
         user_pass = '%s:%s' % (self.user.username, 'invalidpassword')
         auth_header = 'Basic %s' % user_pass.encode('base64')
         url = reverse('ios-notifications-device-create')
@@ -196,21 +205,27 @@ class AuthenticationDecoratorTestAuthBasic(TestCase):
         self.assertEquals(resp.status_code, 401)
         self.assertTrue('authentication error' in resp.content)
 
+    @override_settings(IOS_NOTIFICATIONS_AUTHENTICATION='AuthBasic')
     def test_basic_authorization_missing_header(self):
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthBasic')
         url = reverse('ios-notifications-device-create')
         resp = self.client.get(url)
         self.assertEquals(resp.status_code, 401)
         self.assertTrue('Authorization header not set' in resp.content)
 
+    @override_settings(IOS_NOTIFICATIONS_AUTHENTICATION='AuthDoesNotExist')
     def test_invalid_authentication_type(self):
         from ios_notifications.decorators import InvalidAuthenticationType
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthDoesNotExist')
         url = reverse('ios-notifications-device-create')
         self.assertRaises(InvalidAuthenticationType, self.client.get, url)
 
+    @override_settings(IOS_NOTIFICATIONS_AUTHENTICATION=None)
+    def test_no_authentication_type(self):
+        from ios_notifications.decorators import InvalidAuthenticationType
+        url = reverse('ios-notifications-device-create')
+        self.assertRaises(InvalidAuthenticationType, self.client.get, url)
+
+    @override_settings(IOS_NOTIFICATIONS_AUTHENTICATION='AuthBasicIsStaff')
     def test_basic_authorization_is_staff(self):
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthBasicIsStaff')
         kwargs = {'token': self.device.token, 'service__id': self.device.service.id}
         url = reverse('ios-notifications-device', kwargs=kwargs)
         user_pass = '%s:%s' % (self.user.username, self.user_password)
@@ -219,8 +234,8 @@ class AuthenticationDecoratorTestAuthBasic(TestCase):
         resp = self.client.get(url, HTTP_AUTHORIZATION=auth_header)
         self.assertEquals(resp.status_code, 200)
 
+    @override_settings(IOS_NOTIFICATIONS_AUTHENTICATION='AuthBasicIsStaff')
     def test_basic_authorization_is_staff_with_non_staff_user(self):
-        setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', 'AuthBasicIsStaff')
         kwargs = {'token': self.device.token, 'service__id': self.device.service.id}
         url = reverse('ios-notifications-device', kwargs=kwargs)
         user_pass = '%s:%s' % (self.user.username, self.user_password)
@@ -231,18 +246,8 @@ class AuthenticationDecoratorTestAuthBasic(TestCase):
         self.assertEquals(resp.status_code, 401)
         self.assertTrue('authentication error' in resp.content)
 
-    def tearDown(self):
-        if self.AUTH == 'NotSpecified':
-            del settings.IOS_NOTIFICATIONS_AUTHENTICATION
-        else:
-            setattr(settings, 'IOS_NOTIFICATIONS_AUTHENTICATION', self.AUTH)
 
-
-class NotificationTest(TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
-
+class NotificationTest(UseMockSSLServerMixin, TestCase):
     def setUp(self):
         cert, key = generate_cert_and_pkey()
         self.service = APNService.objects.create(name='service', hostname='127.0.0.1',
@@ -270,6 +275,15 @@ class NotificationTest(TestCase):
         self.assertEqual(self.notification.custom_payload, json.dumps(custom_payload))
         self.assertEqual(self.notification.extra, custom_payload)
         self.assertTrue(self.notification.is_valid_length())
+
+    def test_loc_data_payload(self):
+        self.notification.set_loc_data('TEST_1', [1, 'ab', 1.2, 'CD'])
+        self.notification.message = 'test message'
+        loc_data = {'loc-key': 'TEST_1', 'loc-args': ['1', 'ab', '1.2', 'CD']}
+        self.assertEqual(self.notification.loc_data, loc_data)
+        self.assertTrue(self.notification.is_valid_length())
+        p = self.notification.payload
+        self.assertEqual(json.loads(p)['aps']['alert'], loc_data)
 
     def test_extra_property_not_dict(self):
         with self.assertRaises(TypeError):
@@ -301,16 +315,8 @@ class NotificationTest(TestCase):
         self.assertIsNone(notification.last_sent_at)
         self.assertIsNone(notification.pk)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.test_server_proc.kill()
 
-
-class ManagementCommandPushNotificationTest(TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.test_server_proc = subprocess.Popen(SSL_SERVER_COMMAND, stdout=subprocess.PIPE)
-
+class ManagementCommandPushNotificationTest(UseMockSSLServerMixin, TestCase):
     def setUp(self):
         self.started_at = dt_now()
         cert, key = generate_cert_and_pkey()
@@ -319,38 +325,40 @@ class ManagementCommandPushNotificationTest(TestCase):
         self.service.PORT = 2195
         self.device = Device.objects.create(token=TOKEN, service=self.service)
 
-        self.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = getattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS', 'NotSpecified')
-
-    def test_call_push_ios_notification_command_persist(self):
+    def test_call_push_ios_notification_command_explicit_persist(self):
         msg = 'some message'
         management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0, 'persist': True})
         self.assertTrue(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
         self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
 
-    def test_call_push_ios_notification_command_no_persist(self):
+    def test_call_push_ios_notification_command_explicit_no_persist(self):
         msg = 'some message'
         management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0, 'persist': False})
         self.assertFalse(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
         self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
 
+    @override_settings(IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS=True)
     def test_call_push_ios_notification_command_default_persist(self):
         msg = 'some message'
-        settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = True
         management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0})
         self.assertTrue(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
         self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
 
+    @override_settings(IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS=False)
     def test_call_push_ios_notification_command_default_no_persist(self):
         msg = 'some message'
-        settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = False
         management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0})
         self.assertFalse(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
         self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
 
+    @override_settings()
     def test_call_push_ios_notification_command_default_persist_not_specified(self):
-        msg = 'some message'
-        if hasattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS'):
+        try:
+            # making sure that IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS is not specified in app settings, otherwise this test means nothing
             del settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS
+        except AttributeError:
+            pass
+        msg = 'some message'
         management.call_command('push_ios_notification', **{'message': msg, 'service': self.service.id, 'verbosity': 0})
         self.assertTrue(Notification.objects.filter(message=msg, last_sent_at__gt=self.started_at).exists())
         self.assertTrue(self.device in Device.objects.filter(last_notified_at__gt=self.started_at))
@@ -364,17 +372,22 @@ class ManagementCommandPushNotificationTest(TestCase):
             management.call_command('push_ios_notification', service=self.service.pk,
                                     verbosity=0, stderr=StringIO.StringIO())
 
-    def tearDown(self):
-        if self.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS == 'NotSpecified':
-            if hasattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS'):
-                del settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS
-        else:
-            settings.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS = self.IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.test_server_proc.kill()
-
 
 class ManagementCommandCallFeedbackService(TestCase):
     pass
+
+
+class DefaultSettings(TestCase):
+    def test_persist_notifications_setting(self):
+        self.assertEqual(True, get_setting('IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS'))
+
+    def test_authentication_setting(self):
+        self.assertEqual(None, get_setting('IOS_NOTIFICATIONS_AUTHENTICATION'))
+
+    def test_auth_user_model(self):
+        self.assertEqual('auth.User', get_setting('AUTH_USER_MODEL'))
+
+    def test_invalid_setting(self):
+        setting_name = '_THIS_SETTING_SHOULD_NOT_EXIST__________'
+        with self.assertRaises(KeyError):
+            get_setting(setting_name)

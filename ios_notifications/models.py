@@ -7,7 +7,6 @@ import sys
 from binascii import hexlify, unhexlify
 
 from django.db import models
-from django.conf import settings
 
 try:
     from django.utils.timezone import now as dt_now
@@ -18,7 +17,14 @@ except ImportError:
 from django_fields.fields import EncryptedCharField
 import OpenSSL
 
+try:
+    import gevent_openssl
+    GEVENT_OPEN_SSL=True
+except:
+    GEVENT_OPEN_SSL=False
+
 from .exceptions import NotificationPayloadSizeExceeded, InvalidPassPhrase
+from .settings import get_setting
 
 from apnsclient import *
 from raven import Client
@@ -59,7 +65,10 @@ class BaseService(models.Model):
         context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
         context.use_certificate(cert)
         context.use_privatekey(pkey)
-        self.connection = OpenSSL.SSL.Connection(context, sock)
+        if GEVENT_OPEN_SSL:
+            self.connection = gevent_openssl.SSL.Connection(context, sock)
+        else:
+            self.connection = OpenSSL.SSL.Connection(context, sock)
         self.connection.connect((self.hostname, self.PORT))
         self.connection.set_connect_state()
         self.connection.do_handshake()
@@ -86,7 +95,9 @@ class APNService(BaseService):
     """
     certificate = models.TextField()
     private_key = models.TextField()
-    passphrase = EncryptedCharField(null=True, blank=True, help_text='Passphrase for the private key')
+    passphrase = EncryptedCharField(
+        null=True, blank=True, help_text='Passphrase for the private key',
+        block_type='MODE_CBC')
 
     PORT = 2195
     fmt = '!cH32sH%ds'
@@ -223,7 +234,7 @@ class APNService(BaseService):
                     # if the device no longer accepts push notifications from your app
                     # and you send one to it anyways, Apple immediately drops the connection to your APNS socket.
                     # http://stackoverflow.com/a/13332486/1025116
-                    self._write_message(notification, chunk[i + 1:])
+                    self._write_message(notification, chunk[i + 1:], chunk_size)
 
             self._disconnect()
 
@@ -278,13 +289,15 @@ class Notification(models.Model):
     service = models.ForeignKey(APNService)
     message = models.CharField(max_length=200, blank=True, help_text='Alert message to display to the user. Leave empty if no alert should be displayed to the user.')
     badge = models.PositiveIntegerField(null=True, blank=True, help_text='New application icon badge number. Set to None if the badge number must not be changed.')
+    silent = models.NullBooleanField(null=True, blank=True, help_text='set True to send a silent notification')
     sound = models.CharField(max_length=30, blank=True, help_text='Name of the sound to play. Leave empty if no sound should be played.')
     created_at = models.DateTimeField(auto_now_add=True)
     last_sent_at = models.DateTimeField(null=True, blank=True)
     custom_payload = models.CharField(max_length=240, blank=True, help_text='JSON representation of an object containing custom payload.')
+    loc_payload = models.CharField(max_length=240, blank=True, help_text="JSON representation of an object containing the localization payload.")
 
     def __init__(self, *args, **kwargs):
-        self.persist = getattr(settings, 'IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS', True)
+        self.persist = get_setting('IOS_NOTIFICATIONS_PERSIST_NOTIFICATIONS')
         super(Notification, self).__init__(*args, **kwargs)
 
     def __unicode__(self):
@@ -308,6 +321,28 @@ class Notification(models.Model):
                 raise TypeError('must be a valid Python dictionary')
             self.custom_payload = json.dumps(value)  # Raises a TypeError if can't be serialized
 
+    @property
+    def loc_data(self):
+        """
+        The loc_data property is used to specify localization paramaters within the 'alert' aps key.
+        https://developer.apple.com/library/ios/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/Chapters/ApplePushService.html
+        """
+        return json.loads(self.loc_payload) if self.loc_payload else None
+
+    def set_loc_data(self, loc_key, loc_args, action_loc_key=None):
+        if not isinstance(loc_args, (list, tuple)):
+            raise TypeError("loc_args must be a list or tuple.")
+
+        loc_data = {
+            "loc-key": unicode(loc_key),
+            "loc-args": [unicode(a) for a in loc_args],
+        }
+
+        if action_loc_key:
+            loc_data['action-loc-key'] = unicode(action_loc_key)
+
+        self.loc_payload = json.dumps(loc_data)
+
     def push_to_all_devices(self):
         """
         Pushes this notification to all active devices using the
@@ -326,17 +361,24 @@ class Notification(models.Model):
     @property
     def payload(self):
         aps = {}
-        if self.message:
+
+        loc_data = self.loc_data
+        if loc_data:
+            aps['alert'] = loc_data
+        elif self.message:
             aps['alert'] = self.message
+
         if self.badge is not None:
             aps['badge'] = self.badge
         if self.sound:
             aps['sound'] = self.sound
+        if self.silent:
+            aps['content-available'] = 1
         message = {'aps': aps}
         extra = self.extra
         if extra is not None:
             message.update(extra)
-        payload = json.dumps(message, separators=(',', ':'))
+        payload = json.dumps(message, separators=(',', ':'), ensure_ascii=False).encode('utf8')
         return payload
 
 
@@ -348,7 +390,7 @@ class Device(models.Model):
     is_active = models.BooleanField(default=True)
     deactivated_at = models.DateTimeField(null=True, blank=True)
     service = models.ForeignKey(APNService)
-    users = models.ManyToManyField(getattr(settings, 'AUTH_USER_MODEL', 'auth.User'), null=True, blank=True, related_name='ios_devices')
+    users = models.ManyToManyField(get_setting('AUTH_USER_MODEL'), null=True, blank=True, related_name='ios_devices')
     added_at = models.DateTimeField(auto_now_add=True)
     last_notified_at = models.DateTimeField(null=True, blank=True)
     platform = models.CharField(max_length=30, blank=True, null=True)
@@ -363,7 +405,7 @@ class Device(models.Model):
         if not isinstance(notification, Notification):
             raise TypeError('notification should be an instance of ios_notifications.models.Notification')
 
-        notification.service.push_notification_to_devices(notification, [self])
+        self.service.push_notification_to_devices(notification, [self])
 
     def __unicode__(self):
         return self.token
