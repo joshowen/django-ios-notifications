@@ -3,7 +3,6 @@ import socket
 import struct
 import errno
 import json
-import sys
 from binascii import hexlify, unhexlify
 
 from django.db import models
@@ -26,15 +25,6 @@ except:
 from .exceptions import NotificationPayloadSizeExceeded, InvalidPassPhrase
 from .settings import get_setting
 
-from apnsclient import *
-from raven import Client
-
-def chunks(l, n):
-    """
-    Yield successive n-sized chunks from l.
-    """
-    for i in xrange(0, len(l), n):
-        yield l[i:i+n]
 
 class BaseService(models.Model):
     """
@@ -117,84 +107,7 @@ class APNService(BaseService):
         """
         if devices is None:
             devices = self.device_set.filter(is_active=True)
-
-        """
-        Modified Push Process
-        """
-
-        # begin session
-        self.session = Session()
-
-        # cycle through in batches of `100`
-        for devices_chunk in chunks(devices, 100):
-
-            tokens = []
-            for device in devices_chunk:
-                tokens.append(device.token)
-
-            message = Message(tokens, sound="default", badge=0, alert=notification.message, **notification.extra)
-
-            self._write_message_with_apnsclient(message, devices_chunk)
-
-    def _write_message_with_apnsclient(self, message, devices):
-
-        # start with all devices in "complete" list. remove as necessary.
-        # convert to list: attempting to avoid deadlock in "set_devices_last_notified_at"
-        complete_devices = list(devices[:])
-        fail_devices = []
-        retry_devices = []
-
-        con = self.session.get_connection(address=(self.hostname, 2195), cert_string=self.certificate, key_string=self.private_key)
-
-        srv = APNs(con)
-        res = srv.send(message)
-
-        # Check failures. Check codes in APNs reference docs.
-        for token, reason in res.failed.items():
-            code, errmsg = reason
-
-            # Log with sentry
-            client = Client(dsn=settings.RAVEN_CONFIG['dsn'])
-            client.captureMessage("APNs Failure - Reason:%s - Device:%s" % (errmsg, token))
-
-            # Disable device
-            for device in devices:
-                if device.token == token:
-                    complete_devices.remove(device)
-
-                    device.is_active = False
-                    device.save()
-
-            print "Device faled: {0}, reason: {1}".format(token, errmsg)
-
-        # Check failures not related to devices.
-        for code, errmsg in res.errors:
-
-            # Log with sentry
-            client = Client(dsn=settings.RAVEN_CONFIG['dsn'])
-            client.captureMessage("APNs Failure - Error:%s" % errmsg)
-
-            print "Error: ", errmsg
-
-        # Check if there are tokens that can be retried
-        if res.needs_retry():
-            # repeat with retry_message
-            retry_message = res.retry()
-
-            # add retried devices to "retry_devices"
-            for token in retry_message.tokens:
-                for device in complete_devices:
-                    if device.token == token:
-                        retry_devices.append(device)
-            # remove retried devices from "complete_devices"
-            for device in retry_devices:
-                complete_devices.remove(device)
-
-            # retry message
-            self._write_message_with_apnsclient(retry_message, retry_devices)
-
-        # set date of last message for "complete_devices"
-        self.set_devices_last_notified_at(complete_devices)
+        self._write_message(notification, devices, chunk_size)
 
     def _write_message(self, notification, devices, chunk_size):
         """
@@ -251,17 +164,7 @@ class APNService(BaseService):
         # Since the devices argument could be a sliced queryset
         # we can't rely on devices.update() even if devices is
         # a queryset object.
-
-        try:
-            Device.objects.filter(pk__in=[d.pk for d in devices]).update(last_notified_at=dt_now())
-        except:
-            # catchall for deadlock; should not occur, but notifications are too important to be allowed to fail\
-            client = Client(dsn=settings.RAVEN_CONFIG['dsn'])
-            try:
-                exc_info = sys.exc_info()
-                client.captureException(exc_info)
-            finally:
-                del exc_info
+        Device.objects.filter(pk__in=[d.pk for d in devices]).update(last_notified_at=dt_now())
 
     def pack_message(self, payload, device):
         """
@@ -390,7 +293,7 @@ class Device(models.Model):
     is_active = models.BooleanField(default=True)
     deactivated_at = models.DateTimeField(null=True, blank=True)
     service = models.ForeignKey(APNService)
-    users = models.ManyToManyField(get_setting('AUTH_USER_MODEL'), blank=True, related_name='ios_devices')
+    users = models.ManyToManyField(get_setting('AUTH_USER_MODEL'), null=True, blank=True, related_name='ios_devices')
     added_at = models.DateTimeField(auto_now_add=True)
     last_notified_at = models.DateTimeField(null=True, blank=True)
     platform = models.CharField(max_length=30, blank=True, null=True)
@@ -460,3 +363,4 @@ class FeedbackService(BaseService):
 
     class Meta:
         unique_together = ('name', 'hostname')
+    
